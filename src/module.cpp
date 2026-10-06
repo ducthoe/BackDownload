@@ -3,9 +3,12 @@
 #include <jni.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <spawn.h>
+#include <sys/inotify.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -18,6 +21,7 @@ namespace {
 
 constexpr const char *kVaultClass =
     "com/samsung/android/service/vaultkeeper/VaultKeeperManager";
+constexpr const char *kStatusFile = "/data/system/backdownload.status";
 
 void update_status(bool patched) {
     posix_spawn_file_actions_t actions;
@@ -38,42 +42,82 @@ void update_status(bool patched) {
     }
 }
 
-void status_companion(int client) {
+void status_companion([[maybe_unused]] int client) {
     static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
     static unsigned generation = 0;
     pthread_mutex_lock(&mutex);
     const unsigned current = ++generation;
+    const int file = open(kStatusFile, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    struct stat metadata{};
+    if (file < 0 || fstat(file, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+        fchown(file, 1000, 1000) != 0 || fchmod(file, 0600) != 0 || ftruncate(file, 1) != 0) {
+        if (file >= 0) close(file);
+        pthread_mutex_unlock(&mutex);
+        return;
+    }
+    const unsigned char pending = 0;
+    if (pwrite(file, &pending, 1, 0) != 1) {
+        close(file);
+        pthread_mutex_unlock(&mutex);
+        return;
+    }
+    const int events = inotify_init1(IN_CLOEXEC);
+    if (events < 0 || inotify_add_watch(events, kStatusFile, IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF) < 0) {
+        if (events >= 0) close(events);
+        close(file);
+        pthread_mutex_unlock(&mutex);
+        return;
+    }
     update_status(false);
     pthread_mutex_unlock(&mutex);
 
     unsigned char previous = 0;
-    unsigned char status;
-    for (;;) {
-        const ssize_t count = recv(client, &status, 1, 0);
-        if (count < 0 && errno == EINTR) continue;
-        if (count != 1) break;
-        if (status > 1 || status == previous) continue;
+    for (unsigned wait = 0; wait < 120; ++wait) {
+        pollfd event{events, POLLIN, 0};
+        const int ready = poll(&event, 1, 10000);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) break;
         pthread_mutex_lock(&mutex);
-        if (current == generation) update_status(status == 1);
+        if (current != generation) {
+            pthread_mutex_unlock(&mutex);
+            break;
+        }
+        unsigned char status = 0;
+        if (ready > 0) {
+            char buffer[512];
+            if (read(events, buffer, sizeof(buffer)) <= 0 || pread(file, &status, 1, 0) != 1 || status > 3) {
+                pthread_mutex_unlock(&mutex);
+                break;
+            }
+            const unsigned char patched = status & 1;
+            if (patched != previous) update_status(patched == 1);
+            previous = patched;
+        }
         pthread_mutex_unlock(&mutex);
-        previous = status;
+        if (status >= 2) break;
     }
+    close(events);
+    close(file);
 }
 
 struct WorkerArgs {
     JavaVM *vm = nullptr;
-    int status_socket = -1;
 };
 
-struct StatusSocket {
-    int fd;
-    ~StatusSocket() { if (fd >= 0) close(fd); }
-    void report(dmc::Result result) const {
-        const unsigned char status = result == dmc::Result::AlreadyAuthorized ||
-                                     result == dmc::Result::WrittenAndVerified;
+struct StatusWriter {
+    unsigned char verified = 0;
+    ~StatusWriter() { write(verified | 2); }
+    static void write(unsigned char status) {
+        const int fd = open(kStatusFile, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
         if (fd >= 0) {
-            while (send(fd, &status, 1, MSG_NOSIGNAL) < 0 && errno == EINTR) {}
+            while (pwrite(fd, &status, 1, 0) < 0 && errno == EINTR) {}
+            close(fd);
         }
+    }
+    void report(dmc::Result result) {
+        verified = result == dmc::Result::AlreadyAuthorized ||
+                   result == dmc::Result::WrittenAndVerified;
+        write(verified);
     }
 };
 
@@ -155,7 +199,7 @@ struct JniVault {
 void *worker(void *argument) {
     const auto &args = *static_cast<WorkerArgs *>(argument);
     auto *vm = args.vm;
-    const StatusSocket status{args.status_socket};
+    StatusWriter status;
     pthread_setname_np(pthread_self(), "backdownload");
 
     // DmcService resets the AT byte in PHASE_BOOT_COMPLETED. Wait for a normal
@@ -214,20 +258,19 @@ public:
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {
-        worker_args_.status_socket = api_->connectCompanion();
+        const int companion = api_->connectCompanion();
+        if (companion >= 0) {
+            const unsigned char start = 0;
+            send(companion, &start, 1, MSG_NOSIGNAL);
+            close(companion);
+        }
     }
 
     void postServerSpecialize(const zygisk::ServerSpecializeArgs *) override {
-        if (!worker_args_.vm || getuid() != 1000) {
-            if (worker_args_.status_socket >= 0) close(worker_args_.status_socket);
-            return;
-        }
+        if (!worker_args_.vm || getuid() != 1000) return;
         pthread_t thread;
         const int error = pthread_create(&thread, nullptr, worker, &worker_args_);
-        if (error != 0) {
-            if (worker_args_.status_socket >= 0) close(worker_args_.status_socket);
-            return;
-        }
+        if (error != 0) return;
         pthread_detach(thread);
     }
 
