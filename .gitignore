@@ -1,0 +1,5 @@
+/build/
+/dist/
+/module/zygisk/
+__pycache__/
+*.pyc
