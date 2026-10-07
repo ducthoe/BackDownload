@@ -64,7 +64,8 @@ if not version or any(c not in '0123456789.' for c in version):
 if STAGE.exists():
     shutil.rmtree(STAGE)
 (STAGE / 'zygisk').mkdir(parents=True)
-module_files = ['module.prop', 'customize.sh', 'post-fs-data.sh', 'update-status.sh']
+module_files = ['module.prop', 'customize.sh', 'post-fs-data.sh', 'service.sh',
+                'action.sh', 'status.sh', 'update-status.sh']
 for name in module_files:
     shutil.copy2(TEMPLATE / name, STAGE / name)
 
@@ -76,6 +77,12 @@ if not NDK:
     run(test)
 else:
     print('Policy tests compiled for Android; execution requires an Android device')
+
+status_test = BUILD / 'status_test'
+run(CXX, *TARGET, *common, '-O2', ROOT / 'tests/status_test.cpp', '-o', status_test)
+if not NDK:
+    run(status_test)
+run('python3', ROOT / 'tests/status_test.py')
 
 obj = BUILD / 'module.o'
 run(CXX, *TARGET, *common, '-Oz', '-fPIC', '-fvisibility=hidden', '-fstack-protector-strong',
@@ -141,6 +148,8 @@ report = {
     'artifact': artifact.name,
     'artifact_sha256': hashlib.sha256(artifact.read_bytes()).hexdigest(),
     'checks': [('Android policy test compilation' if NDK else 'native policy/error/read-back tests'),
+               ('Android status test compilation' if NDK else 'native policy snapshot and status handoff tests'),
+               'status freshness, failure and Action request/response tests',
                'ELF machine and exported entry',
                '16 KiB segment alignment', 'no private RUNPATH or libc++ dependency',
                'no liblog dependency, Android logging imports, or debug sections',

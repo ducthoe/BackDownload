@@ -3,4 +3,5 @@
 # Copyright (c) 2026 ducttape3
 
 MODDIR=${0%/*}
-sh "$MODDIR/update-status.sh" 0 >/dev/null 2>&1
+rm -f "$MODDIR/.status-description"
+sh "$MODDIR/update-status.sh" reset >/dev/null 2>&1

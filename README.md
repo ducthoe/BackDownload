@@ -6,6 +6,7 @@ Unlocks Download Mode on Samsung devices with a screen lock enabled. Sets the
 DMC AT authorization flag after boot. Requires Root and Zygisk.
 
 Install the ZIP through your root manager and reboot into Android.
+Tap **Action** to read the current policy flags and Download Mode status.
 
 ## Build on Linux
 

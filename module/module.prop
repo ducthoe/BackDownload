@@ -1,6 +1,6 @@
 id=dmc_at_zygisk
 name=backdownload
-version=1.0.4
-versionCode=104
+version=1.0.5
+versionCode=105
 author=ducttape3
-description=Unlocks Download Mode on Samsung devices.
+description=Unlocks Download Mode on Samsung devices. Tap Action to check the policy.

@@ -15,25 +15,25 @@
 #include <unistd.h>
 
 #include "policy.hpp"
+#include "status.hpp"
 #include "zygisk.hpp"
 
 namespace {
 
 constexpr const char *kVaultClass =
     "com/samsung/android/service/vaultkeeper/VaultKeeperManager";
-constexpr const char *kStatusFile = "/data/system/backdownload.status";
 
-void update_status(bool patched) {
+void status_service() {
     posix_spawn_file_actions_t actions;
     if (posix_spawn_file_actions_init(&actions) != 0) return;
-    if (posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0) != 0 ||
+    if (posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0) != 0 ||
+        posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0) != 0 ||
         posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) != 0) {
         posix_spawn_file_actions_destroy(&actions);
         return;
     }
     char *args[] = {const_cast<char *>("/system/bin/sh"),
-                   const_cast<char *>("/data/adb/modules/dmc_at_zygisk/update-status.sh"),
-                   const_cast<char *>(patched ? "1" : "0"), nullptr};
+        const_cast<char *>("/data/adb/modules/dmc_at_zygisk/service.sh"), nullptr};
     pid_t child;
     const int error = posix_spawn(&child, args[0], &actions, nullptr, args, environ);
     posix_spawn_file_actions_destroy(&actions);
@@ -41,84 +41,27 @@ void update_status(bool patched) {
         while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
     }
 }
-
 void status_companion([[maybe_unused]] int client) {
     static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-    static unsigned generation = 0;
     pthread_mutex_lock(&mutex);
-    const unsigned current = ++generation;
-    const int file = open(kStatusFile, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-    struct stat metadata{};
-    if (file < 0 || fstat(file, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
-        fchown(file, 1000, 1000) != 0 || fchmod(file, 0600) != 0 || ftruncate(file, 1) != 0) {
+    const char *paths[] = {status::kPolicyFile, status::kRequestFile};
+    for (const char *path : paths) {
+        const int file = open(path, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+        struct stat metadata{};
+        if (file >= 0 && fstat(file, &metadata) == 0 && S_ISREG(metadata.st_mode) &&
+            fchown(file, 1000, 1000) == 0 && fchmod(file, 0600) == 0) {
+            ftruncate(file, 0);
+        }
         if (file >= 0) close(file);
-        pthread_mutex_unlock(&mutex);
-        return;
     }
-    const unsigned char pending = 0;
-    if (pwrite(file, &pending, 1, 0) != 1) {
-        close(file);
-        pthread_mutex_unlock(&mutex);
-        return;
-    }
-    const int events = inotify_init1(IN_CLOEXEC);
-    if (events < 0 || inotify_add_watch(events, kStatusFile, IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF) < 0) {
-        if (events >= 0) close(events);
-        close(file);
-        pthread_mutex_unlock(&mutex);
-        return;
-    }
-    update_status(false);
     pthread_mutex_unlock(&mutex);
-
-    unsigned char previous = 0;
-    for (unsigned wait = 0; wait < 120; ++wait) {
-        pollfd event{events, POLLIN, 0};
-        const int ready = poll(&event, 1, 10000);
-        if (ready < 0 && errno == EINTR) continue;
-        if (ready < 0) break;
-        pthread_mutex_lock(&mutex);
-        if (current != generation) {
-            pthread_mutex_unlock(&mutex);
-            break;
-        }
-        unsigned char status = 0;
-        if (ready > 0) {
-            char buffer[512];
-            if (read(events, buffer, sizeof(buffer)) <= 0 || pread(file, &status, 1, 0) != 1 || status > 3) {
-                pthread_mutex_unlock(&mutex);
-                break;
-            }
-            const unsigned char patched = status & 1;
-            if (patched != previous) update_status(patched == 1);
-            previous = patched;
-        }
-        pthread_mutex_unlock(&mutex);
-        if (status >= 2) break;
-    }
-    close(events);
-    close(file);
+    // Also start the monitor when Android is soft-restarted after installation.
+    // Its boot/PID lock handles a monitor already started by the root manager.
+    status_service();
 }
 
 struct WorkerArgs {
     JavaVM *vm = nullptr;
-};
-
-struct StatusWriter {
-    unsigned char verified = 0;
-    ~StatusWriter() { write(verified | 2); }
-    static void write(unsigned char status) {
-        const int fd = open(kStatusFile, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
-        if (fd >= 0) {
-            while (pwrite(fd, &status, 1, 0) < 0 && errno == EINTR) {}
-            close(fd);
-        }
-    }
-    void report(dmc::Result result) {
-        verified = result == dmc::Result::AlreadyAuthorized ||
-                   result == dmc::Result::WrittenAndVerified;
-        write(verified);
-    }
 };
 
 bool clear_exception(JNIEnv *env) {
@@ -127,10 +70,27 @@ bool clear_exception(JNIEnv *env) {
     return true;
 }
 
-void sleep_seconds(unsigned seconds) {
-    timespec remaining{static_cast<time_t>(seconds), 0};
-    while (nanosleep(&remaining, &remaining) != 0) {}
-}
+struct Requests {
+    int events = -1;
+    Requests() {
+        events = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+        if (events >= 0 && inotify_add_watch(events, status::kRequestFile,
+                IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF) < 0) {
+            close(events);
+            events = -1;
+        }
+    }
+    ~Requests() { if (events >= 0) close(events); }
+    void wait(unsigned milliseconds) const {
+        pollfd event{events, POLLIN, 0};
+        poll(&event, events >= 0 ? 1 : 0,
+             static_cast<int>(events >= 0 ? milliseconds : 1000));
+        if (events >= 0) {
+            char buffer[512];
+            while (read(events, buffer, sizeof(buffer)) > 0) {}
+        }
+    }
+};
 
 bool boot_completed() {
     char value[PROP_VALUE_MAX]{};
@@ -199,47 +159,73 @@ struct JniVault {
 void *worker(void *argument) {
     const auto &args = *static_cast<WorkerArgs *>(argument);
     auto *vm = args.vm;
-    StatusWriter status;
+    status::Writer writer;
+    Requests requests;
+    char token[status::kTokenSize]{};
     pthread_setname_np(pthread_self(), "backdownload");
 
     // DmcService resets the AT byte in PHASE_BOOT_COMPLETED. Wait for a normal
     // Android boot and let that initialization finish before touching the vault.
-    unsigned wait = 0;
-    while (!boot_completed() && wait < 600) {
-        sleep_seconds(2);
-        wait += 2;
+    const auto boot_deadline = status::uptime() + 600;
+    while (!boot_completed() && status::uptime() < boot_deadline) {
+        status::request_token(status::kRequestFile, token);
+        if (strcmp(token, "stop") == 0) return nullptr;
+        writer.report(token, {"starting", {}});
+        requests.wait(2000);
     }
     if (!boot_completed()) return nullptr;
-    sleep_seconds(10);
+    const auto settle_deadline = status::uptime() + 10;
+    while (status::uptime() < settle_deadline) {
+        status::request_token(status::kRequestFile, token);
+        if (strcmp(token, "stop") == 0) return nullptr;
+        writer.report(token, {"starting", {}});
+        requests.wait(1000);
+    }
 
     JNIEnv *env = nullptr;
     JavaVMAttachArgs attach{JNI_VERSION_1_6, const_cast<char *>("backdownload"), nullptr};
     if (vm->AttachCurrentThreadAsDaemon(&env, &attach) != JNI_OK || !env) {
+        writer.report(token, {"read_failed", {}});
         return nullptr;
     }
 
-    // Only this short startup window is monitored. Ordinary credential and
-    // Maintenance Mode setters preserve byte 2, so continuous polling is needless.
-    for (unsigned attempt = 0; attempt < 36; ++attempt) {
-        if (env->PushLocalFrame(16) != JNI_OK) {
-            clear_exception(env);
-            break;
+    // Startup retries retain the original patch window. Later reads and Action
+    // requests inspect the policy without extending that write window.
+    unsigned attempts = 0;
+    auto next_patch = status::uptime();
+    auto next_check = next_patch;
+    char last_token[status::kTokenSize]{};
+    for (;;) {
+        status::request_token(status::kRequestFile, token);
+        if (strcmp(token, "stop") == 0) break;
+        const auto now = status::uptime();
+        const bool patch = attempts < 36 && now >= next_patch;
+        if (patch || now >= next_check || strcmp(token, last_token) != 0) {
+            status::Sample sample;
+            if (env->PushLocalFrame(16) == JNI_OK) {
+                JniVault access{env};
+                if (access.initialize()) {
+                    const dmc::Vault vault{&access, JniVault::read, JniVault::write};
+                    if (patch && dmc::authorize_at(vault).result == dmc::Result::UnsupportedRecord) {
+                        attempts = 36;
+                    }
+                    sample = status::Sample::inspect(vault);
+                }
+                env->PopLocalFrame(nullptr);
+            } else {
+                clear_exception(env);
+            }
+            writer.report(token, sample);
+            strcpy(last_token, token);
+            next_check = status::uptime() + 30;
+            if (patch && attempts < 36) {
+                ++attempts;
+                next_patch = status::uptime() + 5;
+            }
         }
-        JniVault access{env};
-        dmc::Outcome outcome{dmc::Result::ReadFailed};
-        if (access.initialize()) {
-            const dmc::Vault vault{&access, JniVault::read, JniVault::write};
-            outcome = dmc::authorize_at(vault);
-        }
-        env->PopLocalFrame(nullptr);
-
-        status.report(outcome.result);
-
-        if (outcome.result == dmc::Result::UnsupportedRecord) {
-            vm->DetachCurrentThread();
-            return nullptr;
-        }
-        if (attempt + 1 < 36) sleep_seconds(5);
+        const auto deadline = attempts < 36 && next_patch < next_check ? next_patch : next_check;
+        const auto current = status::uptime();
+        requests.wait(deadline > current ? static_cast<unsigned>((deadline - current) * 1000) : 1);
     }
     vm->DetachCurrentThread();
     return nullptr;
